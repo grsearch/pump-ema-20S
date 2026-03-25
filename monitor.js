@@ -1,34 +1,35 @@
 // src/monitor.js  —  Core monitoring engine (Singleton)
 //
-// Token lifecycle (multi-trade mode):
+// Full lifecycle:
+//   1. Token received via POST /webhook/add-token
+//      → inserted into map with exitSent=false, buySent=false
+//      → _fetchMetaAndMaybeBuy() called immediately (async)
 //
-//   1. POST /webhook/add-token  →  addToken()
-//      - State created with inPosition=false, exitSent=false
-//      - _fetchMetaAndCheckFDV() called immediately
+//   2. _fetchMetaAndMaybeBuy():
+//      → fetch symbol / FDV / LP / age from Birdeye
+//      → if FDV is null (unknown) OR FDV < FDV_MIN_USD:
+//            log warning, set exitSent=true, remove silently after 1s  (no SELL)
+//      → else:
+//            send BUY webhook, set buySent=true
 //
-//   2. _fetchMetaAndCheckFDV()
-//      - Fetches symbol / FDV / LP / age from Birdeye
-//      - FDV null or < FDV_MIN_USD  →  exitSent=true, remove silently (no SELL, no broadcast)
-//      - FDV OK  →  broadcast token_added, EMA monitoring begins
+//   3. Every PRICE_POLL_SEC (5 s):
+//      → for each token where !exitSent: fetch current price from Birdeye
+//      → append tick {time, price}; set entryPrice on first tick after buySent
+//      → ~4 ticks accumulate per 20 s candle
 //
-//   3. Every PRICE_POLL_SEC (5 s)
-//      - Fetch current price for all active tokens
-//      - Append tick {time, price}
+//   4. Every KLINE_INTERVAL_SEC (20 s):
+//      → for each token where buySent && !exitSent:
+//            build 20s OHLCV candles from ticks
+//            run evaluateSignal() → checks EMA9/EMA20 strategy
+//            if signal === 'SELL': send SELL webhook, exitSent=true, remove after 5s
 //
-//   4. Every KLINE_INTERVAL_SEC (15 s)
-//      - Build OHLCV candles from ticks
-//      - evaluateSignal():
-//          BUY  →  sendBuy, inPosition=true, record entryPrice, bullishCount=0
-//          SELL →  sendSell, inPosition=false, entryPrice=null, bearishCount=0, tradeCount++
-//                  token stays in map — can BUY again on next crossover
+//   5. Every 30 s (meta refresh):
+//      → re-fetch FDV; if FDV drops below minimum AND buySent: send SELL, exit
 //
-//   5. Every 30 s  (meta refresh)
-//      - Re-fetch FDV; if inPosition && FDV < min  →  sendSell, exitSent=true, remove
-//
-//   6. Every 10 s  (age check)
-//      - token age >= TOKEN_MAX_AGE_MIN (60 min):
-//          inPosition=true   →  sendSell then remove
-//          inPosition=false  →  remove silently
+//   6. Every 10 s (age check):
+//      → if token age >= TOKEN_MAX_AGE_MIN:
+//            buySent=true  → send SELL, exit
+//            buySent=false → remove silently (was never bought)
 
 const birdeye                          = require('./birdeye');
 const { evaluateSignal, buildCandles } = require('./ema');
@@ -36,11 +37,11 @@ const { sendBuy, sendSell }            = require('./webhookSender');
 const { broadcastToClients }           = require('./wsHub');
 const logger                           = require('./logger');
 
-const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '5');
-const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '15');
-const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES  || '60');
-const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD            || '10000');
-const MAX_TICKS_HISTORY  = 60 * 60 * 2; // cap at 2 h of ticks in RAM
+const PRICE_POLL_SEC     = parseInt(process.env.PRICE_POLL_SEC        || '5');   // price fetch interval
+const KLINE_INTERVAL_SEC = parseInt(process.env.KLINE_INTERVAL_SEC    || '20');  // candle / EMA eval interval
+const TOKEN_MAX_AGE_MIN  = parseInt(process.env.TOKEN_MAX_AGE_MINUTES || '30');
+const FDV_MIN_USD        = parseInt(process.env.FDV_MIN_USD           || '10000');
+const MAX_TICKS_HISTORY  = 60 * 60 * 2; // 2 h of ticks max in RAM
 
 class TokenMonitor {
   static instance = null;
@@ -50,8 +51,8 @@ class TokenMonitor {
   }
 
   constructor() {
-    this.tokens      = new Map(); // Map<address, TokenState>
-    this.signalLog   = [];        // last 200 signal events
+    this.tokens      = new Map();  // Map<address, TokenState>
+    this.signalLog   = [];         // last 200 signal entries
     this._pollTimer  = null;
     this._klineTimer = null;
     this._metaTimer  = null;
@@ -59,10 +60,10 @@ class TokenMonitor {
     this._dashTimer  = null;
   }
 
-  // ── Add token ─────────────────────────────────────────────
+  // ── Add token to whitelist ──────────────────────────────────
   async addToken({ address, symbol, network = 'solana' }) {
     if (this.tokens.has(address)) {
-      logger.info(`[Monitor] Already watching: ${symbol} (${address.slice(0, 8)})`);
+      logger.info(`[Monitor] Already in whitelist: ${symbol} (${address.slice(0,8)})`);
       return { ok: false, reason: 'already_exists' };
     }
 
@@ -82,26 +83,23 @@ class TokenMonitor {
       age:          null,
       entryPrice:   null,
       pnlPct:       null,
-      bullishCount: 0,     // consecutive bars BUY condition held
-      bearishCount: 0,     // consecutive bars SELL condition held
-      inPosition:   false, // true = open buy position
-      tradeCount:   0,     // completed round-trips this session
-      exitSent:     false, // true = token scheduled for removal
+      bearishCount: 0,
+      buySent:      false,
+      exitSent:     false,
     };
 
     this.tokens.set(address, state);
-    logger.info(`[Monitor] ✅ Added to map: ${state.symbol} (${address})`);
+    logger.info(`[Monitor] ✅ Added: ${state.symbol} (${address})`);
 
-    // FDV gate — broadcasts token_added only if token passes
-    await this._fetchMetaAndCheckFDV(state);
+    // Fetch meta first, then conditionally send BUY
+    await this._fetchMetaAndMaybeBuy(state);
 
+    broadcastToClients({ type: 'token_added', data: this._stateView(state) });
     return { ok: true };
   }
 
-  // ── Initial meta fetch + FDV gate ─────────────────────────
-  // FIX: broadcast token_added ONLY after passing FDV check,
-  //      so the dashboard never shows tokens that get immediately rejected.
-  async _fetchMetaAndCheckFDV(state) {
+  // ── Initial meta fetch + FDV gate + BUY signal ───────────────
+  async _fetchMetaAndMaybeBuy(state) {
     try {
       const overview = await birdeye.getTokenOverview(state.address);
       if (overview) {
@@ -117,27 +115,26 @@ class TokenMonitor {
       logger.warn(`[Monitor] meta fetch error ${state.symbol}: ${e.message}`);
     }
 
+    // Reject if FDV is unknown or below minimum — no position opened, no SELL needed
     if (state.fdv === null || state.fdv < FDV_MIN_USD) {
       const reason = state.fdv === null
         ? 'FDV_UNKNOWN'
         : `FDV_TOO_LOW($${state.fdv}<$${FDV_MIN_USD})`;
       logger.warn(`[Monitor] ⛔ ${state.symbol} rejected — ${reason}`);
       state.exitSent = true;
-      // Remove from map silently — no SELL, no dashboard broadcast
       setTimeout(() => this._removeToken(state.address, reason), 1000);
       return;
     }
 
-    logger.info(
-      `[Monitor] ✅ ${state.symbol} approved — FDV $${state.fdv} — waiting for EMA9↑EMA20`
-    );
-    // Only broadcast after passing FDV check
-    broadcastToClients({ type: 'token_added', data: this._stateView(state) });
+    // FDV is known and sufficient — send BUY once.
+    // entryPrice will be set by _pollPrices() on the first successful price tick
+    // after buySent=true (currentPrice is still null at this point).
+    const sig = await sendBuy(state.address, state.symbol, 'NEW_TOKEN_WHITELIST');
+    state.buySent = true;
+    this._addSignalLog(sig);
   }
 
-  // ── Periodic meta refresh every 30 s ─────────────────────
-  // FIX: removed duplicate broadcastToClients call here.
-  //      webhookSender.sendSell() already broadcasts the signal internally.
+  // ── Periodic meta refresh every 30 s ─────────────────────────
   async _fetchMeta(state) {
     if (state.exitSent) return;
     try {
@@ -152,22 +149,15 @@ class TokenMonitor {
         state.age = ((Date.now() - created * 1000) / 60000).toFixed(1);
       }
 
-      // FDV collapse while holding a position → force exit
-      if (state.inPosition && state.fdv !== null && state.fdv < FDV_MIN_USD) {
-        logger.warn(
-          `[Monitor] ⚠️  FDV collapsed: ${state.symbol} $${state.fdv} — forcing SELL`
-        );
-        state.exitSent   = true; // set before await to block concurrent triggers
-        state.inPosition = false;
+      // FDV dropped below minimum after we already bought → SELL and exit
+      if (state.buySent && state.fdv !== null && state.fdv < FDV_MIN_USD) {
+        logger.warn(`[Monitor] ⚠️  FDV dropped: ${state.symbol} FDV=$${state.fdv} — sending SELL`);
         const sig = await sendSell(
-          state.address, state.symbol,
-          `FDV_DROPPED($${state.fdv}<$${FDV_MIN_USD})`
+          state.address, state.symbol, `FDV_DROPPED($${state.fdv}<$${FDV_MIN_USD})`
         );
         state.lastSignal = 'SELL';
-        state.entryPrice = null;
-        state.pnlPct     = null;
+        state.exitSent   = true;
         this._addSignalLog(sig);
-        // sendSell already called broadcastToClients({type:'signal'})
         setTimeout(() => this._removeToken(state.address, 'FDV_DROP'), 5000);
       }
     } catch (e) {
@@ -175,19 +165,23 @@ class TokenMonitor {
     }
   }
 
-  // ── Start timers ──────────────────────────────────────────
+  // ── Start all timers ──────────────────────────────────────────
   start() {
     logger.info(
-      `[Monitor] Starting — poll ${PRICE_POLL_SEC}s | kline ${KLINE_INTERVAL_SEC}s` +
-      ` | FDV_MIN $${FDV_MIN_USD} | max_age ${TOKEN_MAX_AGE_MIN}min`
+      `[Monitor] Starting — price poll ${PRICE_POLL_SEC}s | kline ${KLINE_INTERVAL_SEC}s | FDV_MIN $${FDV_MIN_USD} | max_age ${TOKEN_MAX_AGE_MIN}min`
     );
-    this._pollTimer  = setInterval(() => this._pollPrices(),   PRICE_POLL_SEC * 1000);
-    this._klineTimer = setInterval(() => this._evaluateAll(),  KLINE_INTERVAL_SEC * 1000);
-    this._metaTimer  = setInterval(() => {
-      this.tokens.forEach(s => this._fetchMeta(s));
+    // Price polling: every PRICE_POLL_SEC (5 s) — ~4 ticks per 20 s candle
+    this._pollTimer  = setInterval(() => this._pollPrices(), PRICE_POLL_SEC * 1000);
+    // K-line evaluation: every KLINE_INTERVAL_SEC (20 s)
+    this._klineTimer = setInterval(() => this._evaluateAll(), KLINE_INTERVAL_SEC * 1000);
+    this._metaTimer  = setInterval(async () => {
+      for (const s of this.tokens.values()) {
+        await this._fetchMeta(s);
+        await sleep(50);
+      }
     }, 30_000);
-    this._ageTimer  = setInterval(() => this._checkAgeExpiry(), 10_000);
-    this._dashTimer = setInterval(() => {
+    this._ageTimer   = setInterval(() => this._checkAgeExpiry(), 10_000);
+    this._dashTimer  = setInterval(() => {
       broadcastToClients({ type: 'update', data: this.getDashboardData() });
     }, 3000);
   }
@@ -198,7 +192,9 @@ class TokenMonitor {
     logger.info('[Monitor] Stopped');
   }
 
-  // ── Price polling ─────────────────────────────────────────
+  // ── Poll price every PRICE_POLL_SEC (5 s) ───────────────────
+  // ~4 price samples per 20 s candle → accurate OHLCV high/low.
+  // Requests staggered 50 ms apart to respect Birdeye rate limits.
   async _pollPrices() {
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent) continue;
@@ -209,86 +205,78 @@ class TokenMonitor {
         if (state.ticks.length > MAX_TICKS_HISTORY) {
           state.ticks.splice(0, state.ticks.length - MAX_TICKS_HISTORY);
         }
+        if (state.buySent && state.entryPrice === null) {
+          state.entryPrice = price;
+        }
       }
-      await sleep(50); // stagger requests to respect Birdeye rate limit
+      await sleep(50);
     }
   }
 
-  // ── Candle build + EMA evaluation ─────────────────────────
+  // ── Build 20 s candles & evaluate EMA strategy ───────────────
+  // Runs every KLINE_INTERVAL_SEC (20 s), after ticks have been
+  // accumulating via PRICE_POLL_SEC (5 s). Each 20 s candle contains
+  // ~4 price samples → meaningful high/low/close values.
   async _evaluateAll() {
     for (const [addr, state] of this.tokens.entries()) {
-      if (state.exitSent || !state.ticks.length) continue;
+      if (state.exitSent || !state.buySent || !state.ticks.length) continue;
 
       state.candles = buildCandles(state.ticks, KLINE_INTERVAL_SEC);
-      const result  = evaluateSignal(state.candles, state);
-      state.ema9    = result.ema9;
-      state.ema20   = result.ema20;
 
-      // Update live PnL only while holding
-      if (state.inPosition && state.entryPrice && state.currentPrice) {
+      const result = evaluateSignal(state.candles, state);
+      state.ema9   = result.ema9;
+      state.ema20  = result.ema20;
+
+      // Live unrealised PnL
+      if (state.entryPrice && state.currentPrice) {
         state.pnlPct = (
           (state.currentPrice - state.entryPrice) / state.entryPrice * 100
         ).toFixed(2);
       }
 
-      if (result.signal === 'BUY') {
-        // ── Enter position ───────────────────────────────────
-        logger.warn(`[Strategy] BUY  ${state.symbol} — ${result.reason}`);
-        const sig = await sendBuy(addr, state.symbol, result.reason);
-
-        state.lastSignal  = 'BUY';
-        state.inPosition  = true;
-        // FIX: guard against null currentPrice (price poll may not have fired yet)
-        state.entryPrice  = state.currentPrice ?? null;
-        state.pnlPct      = null;
-        state.bullishCount = 0; // prevent immediate re-fire on next eval
-
-        this._addSignalLog(sig);
-
-      } else if (result.signal === 'SELL') {
-        // ── Exit position ────────────────────────────────────
+      if (result.signal === 'SELL') {
         logger.warn(`[Strategy] SELL ${state.symbol} — ${result.reason}`);
         const sig = await sendSell(addr, state.symbol, result.reason);
-
-        state.lastSignal   = 'SELL';
-        state.inPosition   = false;
-        state.entryPrice   = null;
-        state.pnlPct       = null;
-        state.tradeCount  += 1;
-        state.bearishCount = 0; // prevent immediate re-fire on next eval
-
+        state.lastSignal = 'SELL';
+        state.exitSent   = true;
         this._addSignalLog(sig);
-        // Token stays in map — next BUY crossover will open a new position
+        setTimeout(() => this._removeToken(addr, 'SELL_SIGNAL'), 5000);
       }
     }
   }
 
-  // ── Age expiry ────────────────────────────────────────────
+  // ── Age expiry check every 10 s ──────────────────────────────
+  // Uses the token's real on-chain age (state.age, from Birdeye) when available,
+  // falling back to addedAt (time added to whitelist) if age hasn't been fetched yet.
   async _checkAgeExpiry() {
-    const maxMs = TOKEN_MAX_AGE_MIN * 60 * 1000;
+    const maxMin = TOKEN_MAX_AGE_MIN;
     for (const [addr, state] of this.tokens.entries()) {
       if (state.exitSent) continue;
-      if (Date.now() - state.addedAt < maxMs) continue;
 
-      state.exitSent = true; // block concurrent age-check iterations
+      // Prefer real on-chain age over whitelist-entry age
+      const ageMin = state.age !== null
+        ? parseFloat(state.age)
+        : (Date.now() - state.addedAt) / 60000;
 
-      if (state.inPosition) {
-        logger.info(`[Monitor] ⏰ Age expiry: ${state.symbol} — closing position`);
-        const sig = await sendSell(addr, state.symbol, `AGE_EXPIRY_${TOKEN_MAX_AGE_MIN}min`);
-        state.lastSignal = 'SELL';
-        state.inPosition = false;
-        state.entryPrice = null;
-        state.pnlPct     = null;
+      if (ageMin < maxMin) continue;
+
+      state.exitSent = true; // set first to block any concurrent check
+
+      if (state.buySent) {
+        logger.info(`[Monitor] ⏰ Age expiry: ${state.symbol} (age ${ageMin.toFixed(1)}min) — sending SELL`);
+        const sig = await sendSell(addr, state.symbol, `AGE_EXPIRY_${maxMin}min`);
+        state.lastSignal = 'SELL_AGE';
         this._addSignalLog(sig);
         setTimeout(() => this._removeToken(addr, 'AGE_EXPIRY'), 5000);
       } else {
-        logger.info(`[Monitor] ⏰ Age expiry (no position): ${state.symbol} — removing`);
+        // Never bought — remove silently, no SELL needed
+        logger.info(`[Monitor] ⏰ Age expiry (no position): ${state.symbol} — removing silently`);
         this._removeToken(addr, 'AGE_EXPIRY_NO_POSITION');
       }
     }
   }
 
-  // ── Remove token ──────────────────────────────────────────
+  // ── Remove token from whitelist ───────────────────────────────
   _removeToken(addr, reason) {
     const state = this.tokens.get(addr);
     if (state) {
@@ -319,9 +307,8 @@ class TokenMonitor {
       candleCount:   s.candles.length,
       tickCount:     s.ticks.length,
       addedAt:       s.addedAt,
-      inPosition:    s.inPosition,
-      tradeCount:    s.tradeCount,
       exitSent:      s.exitSent,
+      buySent:       s.buySent,
       recentCandles: s.candles.slice(-60),
     };
   }
