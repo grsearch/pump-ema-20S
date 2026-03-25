@@ -1,0 +1,33 @@
+# /etc/systemd/system/sol-ema-monitor.service
+#
+# Manual install (if not using deploy.sh):
+#   sudo cp sol-ema-monitor.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sol-ema-monitor
+#
+# NOTE: deploy.sh writes this file automatically with correct paths.
+#       This copy uses placeholder paths for reference only.
+
+[Unit]
+Description=SOL EMA Monitor — Solana EMA9/EMA20 Strategy Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/sol-ema-monitor
+EnvironmentFile=/home/ubuntu/sol-ema-monitor/.env
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sol-ema-monitor
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
